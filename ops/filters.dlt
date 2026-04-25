@@ -1,0 +1,53 @@
+# ============================
+#  Image Filters
+# ============================
+
+fun image_filter_invert(img: Image):
+    if img.is_valid() == 0:
+        return
+
+    y: i32 = 0
+    while y < img.height:
+        x: i32 = 0
+        while x < img.width:
+            c: ImageColor = img.get_pixel(x, y)
+            r: i32 = 255 - image_red(c)
+            g: i32 = 255 - image_green(c)
+            b: i32 = 255 - image_blue(c)
+            a: i32 = image_alpha(c)
+            img.set_pixel(x, y, image_rgba(r, g, b, a))
+            x = x + 1
+        y = y + 1
+
+fun image_filter_grayscale(img: Image):
+    if img.is_valid() == 0:
+        return
+
+    y: i32 = 0
+    while y < img.height:
+        x: i32 = 0
+        while x < img.width:
+            c: ImageColor = img.get_pixel(x, y)
+            gray: i32 = (image_red(c) * 30 + image_green(c) * 59 + image_blue(c) * 11) / 100
+            img.set_pixel(x, y, image_rgba(gray, gray, gray, image_alpha(c)))
+            x = x + 1
+        y = y + 1
+
+fun image_filter_threshold(img: Image, threshold: i32):
+    if img.is_valid() == 0:
+        return
+
+    t: i32 = image_clamp_byte(threshold)
+    y: i32 = 0
+    while y < img.height:
+        x: i32 = 0
+        while x < img.width:
+            c: ImageColor = img.get_pixel(x, y)
+            gray: i32 = (image_red(c) + image_green(c) + image_blue(c)) / 3
+            out: i32 = 0
+            if gray >= t:
+                out = 255
+            img.set_pixel(x, y, image_rgba(out, out, out, image_alpha(c)))
+            x = x + 1
+        y = y + 1
+

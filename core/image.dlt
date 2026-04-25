@@ -1,0 +1,123 @@
+# ============================
+#  Image Buffer
+# ============================
+
+IMAGE_CHANNELS_RGBA: i32 = 4
+
+struct Image:
+    width: i32 = 0
+    height: i32 = 0
+    channels: i32 = 4
+    stride: i32 = 0
+    data: i64 = 0
+    owns_data: i32 = 0
+
+    static fun empty() -> Image:
+        return Image()
+
+    static fun create(width: i32, height: i32) -> Image:
+        if width <= 0:
+            return Image.empty()
+        if height <= 0:
+            return Image.empty()
+
+        stride: i32 = width * IMAGE_CHANNELS_RGBA
+        size: i64 = (stride as i64) * (height as i64)
+        pixels: i64 = Memory.malloc_zeroed(size)
+        return Image(width=width, height=height, channels=IMAGE_CHANNELS_RGBA, stride=stride, data=pixels, owns_data=1)
+
+    static fun wrap_rgba(width: i32, height: i32, data: i64) -> Image:
+        if width <= 0:
+            return Image.empty()
+        if height <= 0:
+            return Image.empty()
+        if data == 0:
+            return Image.empty()
+
+        stride: i32 = width * IMAGE_CHANNELS_RGBA
+        return Image(width=width, height=height, channels=IMAGE_CHANNELS_RGBA, stride=stride, data=data, owns_data=0)
+
+    fun is_valid(self) -> i32:
+        if self.width <= 0:
+            return 0
+        if self.height <= 0:
+            return 0
+        if self.data == 0:
+            return 0
+        return 1
+
+    fun byte_size(self) -> i64:
+        return (self.stride as i64) * (self.height as i64)
+
+    fun free(self):
+        if self.owns_data == 1:
+            if self.data != 0:
+                Memory.free(self.data)
+        self.width = 0
+        self.height = 0
+        self.channels = IMAGE_CHANNELS_RGBA
+        self.stride = 0
+        self.data = 0
+        self.owns_data = 0
+
+    fun in_bounds(self, x: i32, y: i32) -> i32:
+        if x < 0:
+            return 0
+        if y < 0:
+            return 0
+        if x >= self.width:
+            return 0
+        if y >= self.height:
+            return 0
+        return 1
+
+    fun pixel_offset(self, x: i32, y: i32) -> i64:
+        row: i64 = (y as i64) * (self.stride as i64)
+        col: i64 = (x as i64) * (self.channels as i64)
+        return row + col
+
+    fun clear(self, color: ImageColor):
+        if self.is_valid() == 0:
+            return
+
+        y: i32 = 0
+        while y < self.height:
+            x: i32 = 0
+            while x < self.width:
+                self.set_pixel(x, y, color)
+                x = x + 1
+            y = y + 1
+
+    fun set_pixel(self, x: i32, y: i32, color: ImageColor):
+        if self.in_bounds(x, y) == 0:
+            return
+
+        base: i64 = self.data + self.pixel_offset(x, y)
+        Memory.write_i8(base, image_red(color) as i8)
+        Memory.write_i8(base + 1, image_green(color) as i8)
+        Memory.write_i8(base + 2, image_blue(color) as i8)
+        Memory.write_i8(base + 3, image_alpha(color) as i8)
+
+    fun get_pixel(self, x: i32, y: i32) -> ImageColor:
+        if self.in_bounds(x, y) == 0:
+            return image_rgba(0, 0, 0, 0)
+
+        base: i64 = self.data + self.pixel_offset(x, y)
+        r: i32 = image_u8_to_i32(Memory.read_i8(base))
+        g: i32 = image_u8_to_i32(Memory.read_i8(base + 1))
+        b: i32 = image_u8_to_i32(Memory.read_i8(base + 2))
+        a: i32 = image_u8_to_i32(Memory.read_i8(base + 3))
+        return image_rgba(r, g, b, a)
+
+    fun copy_from(self, src: Image) -> i32:
+        if self.is_valid() == 0:
+            return 0
+        if src.is_valid() == 0:
+            return 0
+        if self.width != src.width:
+            return 0
+        if self.height != src.height:
+            return 0
+
+        Memory.copy(self.data, src.data, src.byte_size())
+        return 1

@@ -1,0 +1,679 @@
+# ============================
+#  JPEG Codec
+# ============================
+# Minimal baseline JPEG writer for experiments.
+# Writes RGB baseline JPEG, 8-bit, no chroma subsampling, pure Dolet.
+
+JPEG_MAX_AC_VALUE: i32 = 1023
+JPEG_MAX_DC_DIFF: i32 = 2047
+
+struct JpegBitWriter:
+    data: i64 = 0
+    capacity: i64 = 0
+    pos: i64 = 0
+    current: i32 = 0
+    bit_count: i32 = 0
+
+    static fun create(capacity: i64) -> JpegBitWriter:
+        buf: i64 = Memory.malloc_zeroed(capacity)
+        return JpegBitWriter(data=buf, capacity=capacity, pos=0, current=0, bit_count=0)
+
+    fun free(self):
+        if self.data != 0:
+            Memory.free(self.data)
+        self.data = 0
+        self.capacity = 0
+        self.pos = 0
+        self.current = 0
+        self.bit_count = 0
+
+    fun write_byte(self, value: i32):
+        if self.pos >= self.capacity:
+            return
+        v: i32 = value & 255
+        Memory.write_i8(self.data + self.pos, v as i8)
+        self.pos = self.pos + 1
+        if v == 255:
+            if self.pos < self.capacity:
+                Memory.write_i8(self.data + self.pos, 0 as i8)
+                self.pos = self.pos + 1
+
+    fun write_bits(self, code: i32, size: i32):
+        if size <= 0:
+            return
+        i: i32 = size - 1
+        while i >= 0:
+            bit: i32 = (code >> i) & 1
+            self.current = (self.current << 1) | bit
+            self.bit_count = self.bit_count + 1
+            if self.bit_count == 8:
+                self.write_byte(self.current)
+                self.current = 0
+                self.bit_count = 0
+            i = i - 1
+
+    fun flush(self):
+        if self.bit_count > 0:
+            pad: i32 = 8 - self.bit_count
+            self.current = (self.current << pad) | ((1 << pad) - 1)
+            self.write_byte(self.current)
+            self.current = 0
+            self.bit_count = 0
+
+fun jpeg_write_u8(buf: i64, pos: i64, value: i32) -> i64:
+    Memory.write_i8(buf + pos, value as i8)
+    return pos + 1
+
+fun jpeg_write_be16(buf: i64, pos: i64, value: i32) -> i64:
+    Memory.write_i8(buf + pos, ((value >> 8) & 255) as i8)
+    Memory.write_i8(buf + pos + 1, (value & 255) as i8)
+    return pos + 2
+
+fun jpeg_write_marker(file: File, marker: i32) -> i32:
+    buf: i64 = Memory.malloc_zeroed(2)
+    Memory.write_i8(buf, 255 as i8)
+    Memory.write_i8(buf + 1, marker as i8)
+    written: i32 = file.write_bytes(buf, 2)
+    Memory.free(buf)
+    if written == 2:
+        return 1
+    return 0
+
+fun jpeg_clamp_quality(quality: i32) -> i32:
+    if quality < 1:
+        return 1
+    if quality > 100:
+        return 100
+    return quality
+
+fun jpeg_abs(value: i32) -> i32:
+    if value < 0:
+        return 0 - value
+    return value
+
+fun jpeg_div_round(value: i64, divisor: i64) -> i32:
+    if value >= 0:
+        return ((value + (divisor / 2)) / divisor) as i32
+    return ((value - (divisor / 2)) / divisor) as i32
+
+fun jpeg_clamp_i32(value: i32, min_value: i32, max_value: i32) -> i32:
+    if value < min_value:
+        return min_value
+    if value > max_value:
+        return max_value
+    return value
+
+fun jpeg_category(value: i32) -> i32:
+    v: i32 = jpeg_abs(value)
+    if v == 0:
+        return 0
+    size: i32 = 0
+    while v > 0:
+        size = size + 1
+        v = v >> 1
+    return size
+
+fun jpeg_amplitude_bits(value: i32, size: i32) -> i32:
+    if size == 0:
+        return 0
+    if value >= 0:
+        return value
+    return ((1 << size) - 1) + value
+
+fun jpeg_zigzag(idx: i32) -> i32:
+    if idx == 0: return 0
+    if idx == 1: return 1
+    if idx == 2: return 8
+    if idx == 3: return 16
+    if idx == 4: return 9
+    if idx == 5: return 2
+    if idx == 6: return 3
+    if idx == 7: return 10
+    if idx == 8: return 17
+    if idx == 9: return 24
+    if idx == 10: return 32
+    if idx == 11: return 25
+    if idx == 12: return 18
+    if idx == 13: return 11
+    if idx == 14: return 4
+    if idx == 15: return 5
+    if idx == 16: return 12
+    if idx == 17: return 19
+    if idx == 18: return 26
+    if idx == 19: return 33
+    if idx == 20: return 40
+    if idx == 21: return 48
+    if idx == 22: return 41
+    if idx == 23: return 34
+    if idx == 24: return 27
+    if idx == 25: return 20
+    if idx == 26: return 13
+    if idx == 27: return 6
+    if idx == 28: return 7
+    if idx == 29: return 14
+    if idx == 30: return 21
+    if idx == 31: return 28
+    if idx == 32: return 35
+    if idx == 33: return 42
+    if idx == 34: return 49
+    if idx == 35: return 56
+    if idx == 36: return 57
+    if idx == 37: return 50
+    if idx == 38: return 43
+    if idx == 39: return 36
+    if idx == 40: return 29
+    if idx == 41: return 22
+    if idx == 42: return 15
+    if idx == 43: return 23
+    if idx == 44: return 30
+    if idx == 45: return 37
+    if idx == 46: return 44
+    if idx == 47: return 51
+    if idx == 48: return 58
+    if idx == 49: return 59
+    if idx == 50: return 52
+    if idx == 51: return 45
+    if idx == 52: return 38
+    if idx == 53: return 31
+    if idx == 54: return 39
+    if idx == 55: return 46
+    if idx == 56: return 53
+    if idx == 57: return 60
+    if idx == 58: return 61
+    if idx == 59: return 54
+    if idx == 60: return 47
+    if idx == 61: return 55
+    if idx == 62: return 62
+    return 63
+
+fun jpeg_dct_basis(u: i32, x: i32) -> i32:
+    if u == 0:
+        return 724
+    if u == 1:
+        if x == 0: return 1004
+        if x == 1: return 851
+        if x == 2: return 569
+        if x == 3: return 200
+        if x == 4: return -200
+        if x == 5: return -569
+        if x == 6: return -851
+        return -1004
+    if u == 2:
+        if x == 0: return 946
+        if x == 1: return 392
+        if x == 2: return -392
+        if x == 3: return -946
+        if x == 4: return -946
+        if x == 5: return -392
+        if x == 6: return 392
+        return 946
+    if u == 3:
+        if x == 0: return 851
+        if x == 1: return -200
+        if x == 2: return -1004
+        if x == 3: return -569
+        if x == 4: return 569
+        if x == 5: return 1004
+        if x == 6: return 200
+        return -851
+    if u == 4:
+        if x == 0: return 724
+        if x == 1: return -724
+        if x == 2: return -724
+        if x == 3: return 724
+        if x == 4: return 724
+        if x == 5: return -724
+        if x == 6: return -724
+        return 724
+    if u == 5:
+        if x == 0: return 569
+        if x == 1: return -1004
+        if x == 2: return 200
+        if x == 3: return 851
+        if x == 4: return -851
+        if x == 5: return -200
+        if x == 6: return 1004
+        return -569
+    if u == 6:
+        if x == 0: return 392
+        if x == 1: return -946
+        if x == 2: return 946
+        if x == 3: return -392
+        if x == 4: return -392
+        if x == 5: return 946
+        if x == 6: return -946
+        return 392
+    if x == 0: return 200
+    if x == 1: return -569
+    if x == 2: return 851
+    if x == 3: return -1004
+    if x == 4: return 1004
+    if x == 5: return -851
+    if x == 6: return 569
+    return -200
+
+fun jpeg_luma_base(idx: i32) -> i32:
+    if idx == 0: return 16
+    if idx == 1: return 11
+    if idx == 2: return 10
+    if idx == 3: return 16
+    if idx == 4: return 24
+    if idx == 5: return 40
+    if idx == 6: return 51
+    if idx == 7: return 61
+    if idx == 8: return 12
+    if idx == 9: return 12
+    if idx == 10: return 14
+    if idx == 11: return 19
+    if idx == 12: return 26
+    if idx == 13: return 58
+    if idx == 14: return 60
+    if idx == 15: return 55
+    if idx == 16: return 14
+    if idx == 17: return 13
+    if idx == 18: return 16
+    if idx == 19: return 24
+    if idx == 20: return 40
+    if idx == 21: return 57
+    if idx == 22: return 69
+    if idx == 23: return 56
+    if idx == 24: return 14
+    if idx == 25: return 17
+    if idx == 26: return 22
+    if idx == 27: return 29
+    if idx == 28: return 51
+    if idx == 29: return 87
+    if idx == 30: return 80
+    if idx == 31: return 62
+    if idx == 32: return 18
+    if idx == 33: return 22
+    if idx == 34: return 37
+    if idx == 35: return 56
+    if idx == 36: return 68
+    if idx == 37: return 109
+    if idx == 38: return 103
+    if idx == 39: return 77
+    if idx == 40: return 24
+    if idx == 41: return 35
+    if idx == 42: return 55
+    if idx == 43: return 64
+    if idx == 44: return 81
+    if idx == 45: return 104
+    if idx == 46: return 113
+    if idx == 47: return 92
+    if idx == 48: return 49
+    if idx == 49: return 64
+    if idx == 50: return 78
+    if idx == 51: return 87
+    if idx == 52: return 103
+    if idx == 53: return 121
+    if idx == 54: return 120
+    if idx == 55: return 101
+    if idx == 56: return 72
+    if idx == 57: return 92
+    if idx == 58: return 95
+    if idx == 59: return 98
+    if idx == 60: return 112
+    if idx == 61: return 100
+    if idx == 62: return 103
+    return 99
+
+fun jpeg_chroma_base(idx: i32) -> i32:
+    if idx == 0: return 17
+    if idx == 1: return 18
+    if idx == 2: return 24
+    if idx == 3: return 47
+    if idx == 4: return 99
+    if idx == 5: return 99
+    if idx == 6: return 99
+    if idx == 7: return 99
+    if idx == 8: return 18
+    if idx == 9: return 21
+    if idx == 10: return 26
+    if idx == 11: return 66
+    if idx == 12: return 99
+    if idx == 13: return 99
+    if idx == 14: return 99
+    if idx == 15: return 99
+    if idx == 16: return 24
+    if idx == 17: return 26
+    if idx == 18: return 56
+    if idx == 19: return 99
+    if idx == 20: return 99
+    if idx == 21: return 99
+    if idx == 22: return 99
+    if idx == 23: return 99
+    if idx == 24: return 47
+    if idx == 25: return 66
+    return 99
+
+fun jpeg_quant_value(table_id: i32, idx: i32, quality: i32) -> i32:
+    q: i32 = jpeg_clamp_quality(quality)
+    scale: i32 = 0
+    if q < 50:
+        scale = 5000 / q
+    else:
+        scale = 200 - (q * 2)
+
+    base: i32 = jpeg_luma_base(idx)
+    if table_id == 1:
+        base = jpeg_chroma_base(idx)
+
+    value: i32 = (base * scale + 50) / 100
+    return jpeg_clamp_i32(value, 1, 255)
+
+fun jpeg_rgb_component(color: ImageColor, comp: i32) -> i32:
+    r: i32 = image_red(color)
+    g: i32 = image_green(color)
+    b: i32 = image_blue(color)
+    if comp == 0:
+        return ((77 * r) + (150 * g) + (29 * b)) >> 8
+    if comp == 1:
+        return (((0 - 43) * r) + ((0 - 85) * g) + (128 * b) + 32768) >> 8
+    return ((128 * r) + ((0 - 107) * g) + ((0 - 21) * b) + 32768) >> 8
+
+fun jpeg_pixel_component(img: Image, px: i32, py: i32, comp: i32) -> i32:
+    x: i32 = px
+    y: i32 = py
+    if x >= img.width:
+        x = img.width - 1
+    if y >= img.height:
+        y = img.height - 1
+    color: ImageColor = img.get_pixel(x, y)
+    return jpeg_rgb_component(color, comp) - 128
+
+fun jpeg_compute_coeff(img: Image, block_x: i32, block_y: i32, comp: i32, u: i32, v: i32, quality: i32) -> i32:
+    sum: i64 = 0
+    y: i32 = 0
+    while y < 8:
+        x: i32 = 0
+        while x < 8:
+            sample: i32 = jpeg_pixel_component(img, block_x + x, block_y + y, comp)
+            bx: i32 = jpeg_dct_basis(u, x)
+            by: i32 = jpeg_dct_basis(v, y)
+            sum = sum + ((sample as i64) * (bx as i64) * (by as i64))
+            x = x + 1
+        y = y + 1
+
+    natural_idx: i32 = (v * 8) + u
+    qtable: i32 = 0
+    if comp != 0:
+        qtable = 1
+    quant: i32 = jpeg_quant_value(qtable, natural_idx, quality)
+    coeff: i32 = jpeg_div_round(sum, 4194304 * (quant as i64))
+    if natural_idx == 0:
+        return coeff
+    return jpeg_clamp_i32(coeff, 0 - JPEG_MAX_AC_VALUE, JPEG_MAX_AC_VALUE)
+
+fun jpeg_fill_block(img: Image, coeffs: i64, block_x: i32, block_y: i32, comp: i32, quality: i32):
+    v: i32 = 0
+    while v < 8:
+        u: i32 = 0
+        while u < 8:
+            idx: i32 = (v * 8) + u
+            coeff: i32 = jpeg_compute_coeff(img, block_x, block_y, comp, u, v, quality)
+            Memory.write_i32(coeffs + ((idx as i64) * 4), coeff)
+            u = u + 1
+        v = v + 1
+
+fun jpeg_get_coeff(coeffs: i64, natural_idx: i32) -> i32:
+    return Memory.read_i32(coeffs + ((natural_idx as i64) * 4))
+
+fun jpeg_encode_dc(bw: JpegBitWriter, value: i32):
+    diff: i32 = jpeg_clamp_i32(value, 0 - JPEG_MAX_DC_DIFF, JPEG_MAX_DC_DIFF)
+    size: i32 = jpeg_category(diff)
+    bw.write_bits(size, 4)
+    if size > 0:
+        bw.write_bits(jpeg_amplitude_bits(diff, size), size)
+
+fun jpeg_encode_ac_symbol(bw: JpegBitWriter, symbol: i32):
+    code: i32 = 0
+    if symbol == 0:
+        code = 0
+    elif symbol == 240:
+        code = 1
+    else:
+        run: i32 = (symbol >> 4) & 15
+        size: i32 = symbol & 15
+        code = 2 + (run * 10) + (size - 1)
+    bw.write_bits(code, 8)
+
+fun jpeg_encode_block(bw: JpegBitWriter, coeffs: i64, prev_dc: i32) -> i32:
+    dc: i32 = jpeg_get_coeff(coeffs, 0)
+    jpeg_encode_dc(bw, dc - prev_dc)
+
+    zero_run: i32 = 0
+    zi: i32 = 1
+    while zi < 64:
+        coeff: i32 = jpeg_get_coeff(coeffs, jpeg_zigzag(zi))
+        if coeff == 0:
+            zero_run = zero_run + 1
+        else:
+            while zero_run > 15:
+                jpeg_encode_ac_symbol(bw, 240)
+                zero_run = zero_run - 16
+
+            size: i32 = jpeg_category(coeff)
+            if size > 10:
+                size = 10
+                coeff = jpeg_clamp_i32(coeff, 0 - JPEG_MAX_AC_VALUE, JPEG_MAX_AC_VALUE)
+            symbol: i32 = (zero_run << 4) | size
+            jpeg_encode_ac_symbol(bw, symbol)
+            bw.write_bits(jpeg_amplitude_bits(coeff, size), size)
+            zero_run = 0
+        zi = zi + 1
+
+    if zero_run > 0:
+        jpeg_encode_ac_symbol(bw, 0)
+
+    return dc
+
+fun jpeg_write_app0(file: File) -> i32:
+    seg: i64 = Memory.malloc_zeroed(18)
+    pos: i64 = 0
+    pos = jpeg_write_u8(seg, pos, 255)
+    pos = jpeg_write_u8(seg, pos, 224)
+    pos = jpeg_write_be16(seg, pos, 16)
+    pos = jpeg_write_u8(seg, pos, 74)
+    pos = jpeg_write_u8(seg, pos, 70)
+    pos = jpeg_write_u8(seg, pos, 73)
+    pos = jpeg_write_u8(seg, pos, 70)
+    pos = jpeg_write_u8(seg, pos, 0)
+    pos = jpeg_write_u8(seg, pos, 1)
+    pos = jpeg_write_u8(seg, pos, 1)
+    pos = jpeg_write_u8(seg, pos, 0)
+    pos = jpeg_write_be16(seg, pos, 1)
+    pos = jpeg_write_be16(seg, pos, 1)
+    pos = jpeg_write_u8(seg, pos, 0)
+    pos = jpeg_write_u8(seg, pos, 0)
+    written: i32 = file.write_bytes(seg, 18)
+    Memory.free(seg)
+    if written == 18:
+        return 1
+    return 0
+
+fun jpeg_write_dqt(file: File, table_id: i32, quality: i32) -> i32:
+    seg: i64 = Memory.malloc_zeroed(69)
+    pos: i64 = 0
+    pos = jpeg_write_u8(seg, pos, 255)
+    pos = jpeg_write_u8(seg, pos, 219)
+    pos = jpeg_write_be16(seg, pos, 67)
+    pos = jpeg_write_u8(seg, pos, table_id)
+    i: i32 = 0
+    while i < 64:
+        idx: i32 = jpeg_zigzag(i)
+        pos = jpeg_write_u8(seg, pos, jpeg_quant_value(table_id, idx, quality))
+        i = i + 1
+    written: i32 = file.write_bytes(seg, 69)
+    Memory.free(seg)
+    if written == 69:
+        return 1
+    return 0
+
+fun jpeg_write_sof0(file: File, width: i32, height: i32) -> i32:
+    seg: i64 = Memory.malloc_zeroed(19)
+    pos: i64 = 0
+    pos = jpeg_write_u8(seg, pos, 255)
+    pos = jpeg_write_u8(seg, pos, 192)
+    pos = jpeg_write_be16(seg, pos, 17)
+    pos = jpeg_write_u8(seg, pos, 8)
+    pos = jpeg_write_be16(seg, pos, height)
+    pos = jpeg_write_be16(seg, pos, width)
+    pos = jpeg_write_u8(seg, pos, 3)
+    pos = jpeg_write_u8(seg, pos, 1)
+    pos = jpeg_write_u8(seg, pos, 17)
+    pos = jpeg_write_u8(seg, pos, 0)
+    pos = jpeg_write_u8(seg, pos, 2)
+    pos = jpeg_write_u8(seg, pos, 17)
+    pos = jpeg_write_u8(seg, pos, 1)
+    pos = jpeg_write_u8(seg, pos, 3)
+    pos = jpeg_write_u8(seg, pos, 17)
+    pos = jpeg_write_u8(seg, pos, 1)
+    written: i32 = file.write_bytes(seg, 19)
+    Memory.free(seg)
+    if written == 19:
+        return 1
+    return 0
+
+fun jpeg_write_dht_dc(file: File, table_id: i32) -> i32:
+    seg: i64 = Memory.malloc_zeroed(33)
+    pos: i64 = 0
+    pos = jpeg_write_u8(seg, pos, 255)
+    pos = jpeg_write_u8(seg, pos, 196)
+    pos = jpeg_write_be16(seg, pos, 31)
+    pos = jpeg_write_u8(seg, pos, table_id)
+    i: i32 = 1
+    while i <= 16:
+        count: i32 = 0
+        if i == 4:
+            count = 12
+        pos = jpeg_write_u8(seg, pos, count)
+        i = i + 1
+    v: i32 = 0
+    while v < 12:
+        pos = jpeg_write_u8(seg, pos, v)
+        v = v + 1
+    written: i32 = file.write_bytes(seg, 33)
+    Memory.free(seg)
+    if written == 33:
+        return 1
+    return 0
+
+fun jpeg_write_dht_ac(file: File, table_id: i32) -> i32:
+    seg_len: i32 = 183
+    seg: i64 = Memory.malloc_zeroed(seg_len as i64)
+    pos: i64 = 0
+    pos = jpeg_write_u8(seg, pos, 255)
+    pos = jpeg_write_u8(seg, pos, 196)
+    pos = jpeg_write_be16(seg, pos, 181)
+    pos = jpeg_write_u8(seg, pos, 16 | table_id)
+    i: i32 = 1
+    while i <= 16:
+        count: i32 = 0
+        if i == 8:
+            count = 162
+        pos = jpeg_write_u8(seg, pos, count)
+        i = i + 1
+    pos = jpeg_write_u8(seg, pos, 0)
+    pos = jpeg_write_u8(seg, pos, 240)
+    run: i32 = 0
+    while run < 16:
+        size: i32 = 1
+        while size <= 10:
+            pos = jpeg_write_u8(seg, pos, (run << 4) | size)
+            size = size + 1
+        run = run + 1
+    written: i32 = file.write_bytes(seg, seg_len)
+    Memory.free(seg)
+    if written == seg_len:
+        return 1
+    return 0
+
+fun jpeg_write_sos(file: File) -> i32:
+    seg: i64 = Memory.malloc_zeroed(14)
+    pos: i64 = 0
+    pos = jpeg_write_u8(seg, pos, 255)
+    pos = jpeg_write_u8(seg, pos, 218)
+    pos = jpeg_write_be16(seg, pos, 12)
+    pos = jpeg_write_u8(seg, pos, 3)
+    pos = jpeg_write_u8(seg, pos, 1)
+    pos = jpeg_write_u8(seg, pos, 0)
+    pos = jpeg_write_u8(seg, pos, 2)
+    pos = jpeg_write_u8(seg, pos, 17)
+    pos = jpeg_write_u8(seg, pos, 3)
+    pos = jpeg_write_u8(seg, pos, 17)
+    pos = jpeg_write_u8(seg, pos, 0)
+    pos = jpeg_write_u8(seg, pos, 63)
+    pos = jpeg_write_u8(seg, pos, 0)
+    written: i32 = file.write_bytes(seg, 14)
+    Memory.free(seg)
+    if written == 14:
+        return 1
+    return 0
+
+fun jpeg_write_headers(file: File, width: i32, height: i32, quality: i32) -> i32:
+    ok: i32 = 1
+    if jpeg_write_marker(file, 216) == 0: ok = 0
+    if jpeg_write_app0(file) == 0: ok = 0
+    if jpeg_write_dqt(file, 0, quality) == 0: ok = 0
+    if jpeg_write_dqt(file, 1, quality) == 0: ok = 0
+    if jpeg_write_sof0(file, width, height) == 0: ok = 0
+    if jpeg_write_dht_dc(file, 0) == 0: ok = 0
+    if jpeg_write_dht_ac(file, 0) == 0: ok = 0
+    if jpeg_write_dht_dc(file, 1) == 0: ok = 0
+    if jpeg_write_dht_ac(file, 1) == 0: ok = 0
+    if jpeg_write_sos(file) == 0: ok = 0
+    return ok
+
+fun jpeg_encode_entropy(img: Image, bw: JpegBitWriter, quality: i32):
+    coeffs: i64 = Memory.malloc_zeroed(64 * 4)
+    prev_y: i32 = 0
+    prev_cb: i32 = 0
+    prev_cr: i32 = 0
+    by: i32 = 0
+    while by < img.height:
+        bx: i32 = 0
+        while bx < img.width:
+            jpeg_fill_block(img, coeffs, bx, by, 0, quality)
+            prev_y = jpeg_encode_block(bw, coeffs, prev_y)
+
+            jpeg_fill_block(img, coeffs, bx, by, 1, quality)
+            prev_cb = jpeg_encode_block(bw, coeffs, prev_cb)
+
+            jpeg_fill_block(img, coeffs, bx, by, 2, quality)
+            prev_cr = jpeg_encode_block(bw, coeffs, prev_cr)
+
+            bx = bx + 8
+        by = by + 8
+    bw.flush()
+    Memory.free(coeffs)
+
+struct JPEG:
+    static fun save(img: Image, path: str, quality: i32) -> i32:
+        if img.is_valid() == 0:
+            return 0
+
+        q: i32 = jpeg_clamp_quality(quality)
+        file: File = File.open_cwd(path, "w")
+        if file.is_valid() == false:
+            return 0
+
+        ok: i32 = jpeg_write_headers(file, img.width, img.height, q)
+
+        entropy_cap: i64 = ((img.width as i64) * (img.height as i64) * 10) + 8192
+        bw: JpegBitWriter = JpegBitWriter.create(entropy_cap)
+        jpeg_encode_entropy(img, bw, q)
+        written: i32 = file.write_bytes(bw.data, bw.pos as i32)
+        if written != (bw.pos as i32):
+            ok = 0
+        bw.free()
+
+        if jpeg_write_marker(file, 217) == 0:
+            ok = 0
+        file.close()
+        return ok
+
+    static fun load(path: str) -> Image:
+        # TODO: JPEG decoding is much larger than writing; add after encoder settles.
+        return Image.empty()
+

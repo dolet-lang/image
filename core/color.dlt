@@ -1,0 +1,41 @@
+# ============================
+#  Image Color
+# ============================
+# Packed RGBA8 color. In memory, Image stores bytes as R, G, B, A.
+
+type ImageColor = i32
+
+fun image_u8_to_i32(value: i8) -> i32:
+    v: i32 = value as i32
+    if v < 0:
+        return v + 256
+    return v
+
+fun image_clamp_byte(value: i32) -> i32:
+    if value < 0:
+        return 0
+    if value > 255:
+        return 255
+    return value
+
+fun image_rgba(r: i32, g: i32, b: i32, a: i32) -> ImageColor:
+    rr: i32 = image_clamp_byte(r)
+    gg: i32 = image_clamp_byte(g)
+    bb: i32 = image_clamp_byte(b)
+    aa: i32 = image_clamp_byte(a)
+    return (rr & 255) | ((gg & 255) << 8) | ((bb & 255) << 16) | ((aa & 255) << 24)
+
+fun image_rgb(r: i32, g: i32, b: i32) -> ImageColor:
+    return image_rgba(r, g, b, 255)
+
+fun image_red(color: ImageColor) -> i32:
+    return color & 255
+
+fun image_green(color: ImageColor) -> i32:
+    return (color >> 8) & 255
+
+fun image_blue(color: ImageColor) -> i32:
+    return (color >> 16) & 255
+
+fun image_alpha(color: ImageColor) -> i32:
+    return (color >> 24) & 255

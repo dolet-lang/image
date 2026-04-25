@@ -1,0 +1,65 @@
+# ============================
+#  Image Drawing
+# ============================
+
+fun image_abs_i32(value: i32) -> i32:
+    if value < 0:
+        return 0 - value
+    return value
+
+fun image_draw_point(img: Image, x: i32, y: i32, color: ImageColor):
+    img.set_pixel(x, y, color)
+
+fun image_draw_line(img: Image, x0: i32, y0: i32, x1: i32, y1: i32, color: ImageColor):
+    dx: i32 = image_abs_i32(x1 - x0)
+    dy: i32 = 0 - image_abs_i32(y1 - y0)
+    sx: i32 = -1
+    sy: i32 = -1
+    if x0 < x1:
+        sx = 1
+    if y0 < y1:
+        sy = 1
+
+    err: i32 = dx + dy
+    x: i32 = x0
+    y: i32 = y0
+
+    while true:
+        img.set_pixel(x, y, color)
+        if x == x1 and y == y1:
+            break
+        e2: i32 = err * 2
+        if e2 >= dy:
+            err = err + dy
+            x = x + sx
+        if e2 <= dx:
+            err = err + dx
+            y = y + sy
+
+fun image_draw_rect(img: Image, x: i32, y: i32, width: i32, height: i32, color: ImageColor):
+    if width <= 0:
+        return
+    if height <= 0:
+        return
+
+    x2: i32 = x + width - 1
+    y2: i32 = y + height - 1
+    image_draw_line(img, x, y, x2, y, color)
+    image_draw_line(img, x, y2, x2, y2, color)
+    image_draw_line(img, x, y, x, y2, color)
+    image_draw_line(img, x2, y, x2, y2, color)
+
+fun image_fill_rect(img: Image, x: i32, y: i32, width: i32, height: i32, color: ImageColor):
+    if width <= 0:
+        return
+    if height <= 0:
+        return
+
+    yy: i32 = y
+    while yy < y + height:
+        xx: i32 = x
+        while xx < x + width:
+            img.set_pixel(xx, yy, color)
+            xx = xx + 1
+        yy = yy + 1
+

@@ -1,0 +1,15 @@
+# ============================
+#  PPM Codec
+# ============================
+# Placeholder API for the first simple image file format.
+# PPM support should write/read P6 RGB files from/to Image RGBA buffers.
+
+struct PPM:
+    static fun save(img: Image, path: str) -> i32:
+        # TODO: encode P6 header + RGB byte stream.
+        return 0
+
+    static fun load(path: str) -> Image:
+        # TODO: parse P6 header and expand RGB bytes to RGBA.
+        return Image.empty()
+

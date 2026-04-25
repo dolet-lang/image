@@ -1,0 +1,76 @@
+# ============================
+#  Image Transforms
+# ============================
+
+fun image_flip_horizontal(img: Image):
+    if img.is_valid() == 0:
+        return
+
+    y: i32 = 0
+    while y < img.height:
+        x: i32 = 0
+        half: i32 = img.width / 2
+        while x < half:
+            ox: i32 = img.width - x - 1
+            left: ImageColor = img.get_pixel(x, y)
+            right: ImageColor = img.get_pixel(ox, y)
+            img.set_pixel(x, y, right)
+            img.set_pixel(ox, y, left)
+            x = x + 1
+        y = y + 1
+
+fun image_flip_vertical(img: Image):
+    if img.is_valid() == 0:
+        return
+
+    y: i32 = 0
+    half: i32 = img.height / 2
+    while y < half:
+        oy: i32 = img.height - y - 1
+        x: i32 = 0
+        while x < img.width:
+            top: ImageColor = img.get_pixel(x, y)
+            bottom: ImageColor = img.get_pixel(x, oy)
+            img.set_pixel(x, y, bottom)
+            img.set_pixel(x, oy, top)
+            x = x + 1
+        y = y + 1
+
+fun image_crop(img: Image, x: i32, y: i32, width: i32, height: i32) -> Image:
+    if img.is_valid() == 0:
+        return Image.empty()
+    if width <= 0:
+        return Image.empty()
+    if height <= 0:
+        return Image.empty()
+
+    out: Image = Image.create(width, height)
+    yy: i32 = 0
+    while yy < height:
+        xx: i32 = 0
+        while xx < width:
+            out.set_pixel(xx, yy, img.get_pixel(x + xx, y + yy))
+            xx = xx + 1
+        yy = yy + 1
+    return out
+
+fun image_resize_nearest(img: Image, width: i32, height: i32) -> Image:
+    if img.is_valid() == 0:
+        return Image.empty()
+    if width <= 0:
+        return Image.empty()
+    if height <= 0:
+        return Image.empty()
+
+    out: Image = Image.create(width, height)
+    y: i32 = 0
+    while y < height:
+        src_y: i32 = (y * img.height) / height
+        x: i32 = 0
+        while x < width:
+            src_x: i32 = (x * img.width) / width
+            out.set_pixel(x, y, img.get_pixel(src_x, src_y))
+            x = x + 1
+        y = y + 1
+    return out
+

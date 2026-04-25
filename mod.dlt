@@ -1,0 +1,47 @@
+# ============================
+#  Dolet Image Library
+# ============================
+# Pure image buffers, pixel operations, simple codecs, drawing, and filters.
+# Display/window integration belongs in image_viewer or app frameworks.
+module image
+import std
+
+load image/core/color
+load image/core/image
+load image/codecs/ppm
+load image/codecs/png
+load image/codecs/jpeg
+load image/ops/draw
+load image/ops/filters
+load image/ops/transform
+
+export ImageColor
+export Image
+export PPM
+export PNG
+export JPEG
+
+export IMAGE_CHANNELS_RGBA
+
+export image_clamp_byte
+export image_rgb
+export image_rgba
+export image_red
+export image_green
+export image_blue
+export image_alpha
+export image_u8_to_i32
+
+export image_draw_point
+export image_draw_line
+export image_draw_rect
+export image_fill_rect
+
+export image_filter_invert
+export image_filter_grayscale
+export image_filter_threshold
+
+export image_flip_horizontal
+export image_flip_vertical
+export image_crop
+export image_resize_nearest

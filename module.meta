@@ -1,0 +1,20 @@
+# Image Module Metadata
+# Pure Dolet image buffer, codecs, drawing, and filters.
+
+[info]
+name = image
+version = 0.1.0
+description = Pure Dolet image buffer, pixel operations, simple codecs, drawing, filters, and transforms.
+
+[dependencies]
+# none for v0.1; runtime/std are provided by the compiler pipeline
+
+[link.windows]
+# no system libs
+
+[link.linux]
+# no system libs
+
+[link.macos]
+# planned
+

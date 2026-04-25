@@ -1,0 +1,17 @@
+# Build artifacts
+*.exe
+*.obj
+*.o
+*.mlir
+*.ll
+
+# Generated image outputs
+*.png
+*.jpg
+*.jpeg
+*.ppm
+
+# Local tooling
+.pytest_cache/
+__pycache__/
+
