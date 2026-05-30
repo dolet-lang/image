@@ -548,9 +548,15 @@ fun png_channels(color_type: i32) -> i32:
 # size height * (width * channels). `raw` holds height rows, each prefixed
 # with a 1-byte filter type, stride = 1 + width*channels.
 # Returns the unfiltered buffer (caller frees) or 0 on failure.
-fun png_unfilter(raw: i64, width: i32, height: i32, channels: i32) -> i64:
-    bpp: i32 = channels                       # 8-bit: bytes per pixel == channels
-    row_bytes: i64 = (width as i64) * (channels as i64)
+fun png_unfilter(raw: i64, width: i32, height: i32, channels: i32, bit_depth: i32) -> i64:
+    # bytes per pixel for filtering: rounded up to a 1-byte minimum
+    bits_per_pixel: i32 = channels * bit_depth
+    bpp: i32 = bits_per_pixel / 8
+    if bpp < 1:
+        bpp = 1
+    # bytes per scanline = ceil(width * channels * bit_depth / 8)
+    row_bits: i64 = (width as i64) * (channels as i64) * (bit_depth as i64)
+    row_bytes: i64 = (row_bits + 7) / 8
     out: i64 = Memory.malloc_zeroed(row_bytes * (height as i64))
     src_stride: i64 = row_bytes + 1
     y: i32 = 0
@@ -591,36 +597,73 @@ fun png_unfilter(raw: i64, width: i32, height: i32, channels: i32) -> i64:
         y = y + 1
     return out
 
+# Read one sample value at scanline-relative sample index `sample_idx`
+# from a row that starts at byte offset `row_off`. Handles bit depths
+# 1/2/4 (bit-packed MSB-first), 8 (one byte), and 16 (high byte).
+fun png_get_sample(pixels: i64, row_off: i64, sample_idx: i32, bit_depth: i32) -> i32:
+    if bit_depth == 8:
+        return image_u8_to_i32(Memory.read_i8(pixels + row_off + (sample_idx as i64)))
+    if bit_depth == 16:
+        return image_u8_to_i32(Memory.read_i8(pixels + row_off + ((sample_idx as i64) * 2)))
+    # sub-byte: bit_depth is 1, 2, or 4
+    samples_per_byte: i32 = 8 / bit_depth
+    byte_idx: i32 = sample_idx / samples_per_byte
+    within: i32 = sample_idx % samples_per_byte
+    byte_val: i32 = image_u8_to_i32(Memory.read_i8(pixels + row_off + (byte_idx as i64)))
+    # MSB-first: first sample occupies the highest bits
+    shift: i32 = (samples_per_byte - 1 - within) * bit_depth
+    mask: i32 = (1 << bit_depth) - 1
+    return (byte_val >> shift) & mask
+
+# Scale a sample from `bit_depth` bits up to an 8-bit value (for gray/RGB).
+fun png_scale_sample(value: i32, bit_depth: i32) -> i32:
+    if bit_depth == 8:
+        return value
+    if bit_depth == 16:
+        return value
+    if bit_depth == 1:
+        if value != 0:
+            return 255
+        return 0
+    if bit_depth == 2:
+        return value * 85          # 0,1,2,3 -> 0,85,170,255
+    if bit_depth == 4:
+        return value * 17          # 0..15 -> 0..255
+    return value
+
 # Convert unfiltered channel data into an RGBA Image.
 # palette/trns may be 0 when color_type != 3.
-fun png_to_rgba(pixels: i64, width: i32, height: i32, color_type: i32, palette: i64, palette_count: i32, trns: i64, trns_count: i32) -> Image:
+fun png_to_rgba(pixels: i64, width: i32, height: i32, color_type: i32, bit_depth: i32, palette: i64, palette_count: i32, trns: i64, trns_count: i32) -> Image:
     img: Image = Image.create(width, height)
     if img.is_valid() == 0:
         return img
     channels: i32 = png_channels(color_type)
-    row_bytes: i64 = (width as i64) * (channels as i64)
+    # bytes per scanline = ceil(width * channels * bit_depth / 8)
+    row_bits: i64 = (width as i64) * (channels as i64) * (bit_depth as i64)
+    row_bytes: i64 = (row_bits + 7) / 8
     y: i32 = 0
     while y < height:
+        row_off: i64 = (y as i64) * row_bytes
         x: i32 = 0
         while x < width:
-            base: i64 = ((y as i64) * row_bytes) + ((x as i64) * (channels as i64))
+            sample_base: i32 = x * channels
             r: i32 = 0
             g: i32 = 0
             b: i32 = 0
             a: i32 = 255
             if color_type == 0:
-                gray: i32 = image_u8_to_i32(Memory.read_i8(pixels + base))
+                gray: i32 = png_scale_sample(png_get_sample(pixels, row_off, sample_base, bit_depth), bit_depth)
                 r = gray
                 g = gray
                 b = gray
             else:
                 if color_type == 2:
-                    r = image_u8_to_i32(Memory.read_i8(pixels + base))
-                    g = image_u8_to_i32(Memory.read_i8(pixels + base + 1))
-                    b = image_u8_to_i32(Memory.read_i8(pixels + base + 2))
+                    r = png_scale_sample(png_get_sample(pixels, row_off, sample_base, bit_depth), bit_depth)
+                    g = png_scale_sample(png_get_sample(pixels, row_off, sample_base + 1, bit_depth), bit_depth)
+                    b = png_scale_sample(png_get_sample(pixels, row_off, sample_base + 2, bit_depth), bit_depth)
                 else:
                     if color_type == 3:
-                        pidx: i32 = image_u8_to_i32(Memory.read_i8(pixels + base))
+                        pidx: i32 = png_get_sample(pixels, row_off, sample_base, bit_depth)
                         if pidx < palette_count:
                             r = image_u8_to_i32(Memory.read_i8(palette + ((pidx as i64) * 3)))
                             g = image_u8_to_i32(Memory.read_i8(palette + ((pidx as i64) * 3) + 1))
@@ -630,16 +673,16 @@ fun png_to_rgba(pixels: i64, width: i32, height: i32, color_type: i32, palette: 
                                 a = image_u8_to_i32(Memory.read_i8(trns + (pidx as i64)))
                     else:
                         if color_type == 4:
-                            gray2: i32 = image_u8_to_i32(Memory.read_i8(pixels + base))
+                            gray2: i32 = png_scale_sample(png_get_sample(pixels, row_off, sample_base, bit_depth), bit_depth)
                             r = gray2
                             g = gray2
                             b = gray2
-                            a = image_u8_to_i32(Memory.read_i8(pixels + base + 1))
+                            a = png_scale_sample(png_get_sample(pixels, row_off, sample_base + 1, bit_depth), bit_depth)
                         else:
-                            r = image_u8_to_i32(Memory.read_i8(pixels + base))
-                            g = image_u8_to_i32(Memory.read_i8(pixels + base + 1))
-                            b = image_u8_to_i32(Memory.read_i8(pixels + base + 2))
-                            a = image_u8_to_i32(Memory.read_i8(pixels + base + 3))
+                            r = png_scale_sample(png_get_sample(pixels, row_off, sample_base, bit_depth), bit_depth)
+                            g = png_scale_sample(png_get_sample(pixels, row_off, sample_base + 1, bit_depth), bit_depth)
+                            b = png_scale_sample(png_get_sample(pixels, row_off, sample_base + 2, bit_depth), bit_depth)
+                            a = png_scale_sample(png_get_sample(pixels, row_off, sample_base + 3, bit_depth), bit_depth)
             img.set_pixel(x, y, image_rgba(r, g, b, a))
             x = x + 1
         y = y + 1
@@ -735,8 +778,13 @@ fun png_finish_decode(width: i32, height: i32, bit_depth: i32, color_type: i32, 
     ok: i32 = 1
     if width <= 0 or height <= 0:
         ok = 0
-    if bit_depth != 8:
+    # Supported bit depths: 1, 2, 4, 8, 16
+    if bit_depth != 1 and bit_depth != 2 and bit_depth != 4 and bit_depth != 8 and bit_depth != 16:
         ok = 0
+    # Sub-byte depths only apply to grayscale (0) and palette (3)
+    if bit_depth < 8:
+        if color_type != 0 and color_type != 3:
+            ok = 0
     if interlace != 0:
         ok = 0
     channels: i32 = png_channels(color_type)
@@ -751,10 +799,13 @@ fun png_finish_decode(width: i32, height: i32, bit_depth: i32, color_type: i32, 
         raw_len: i64 = Memory.read_i64(len_holder)
         Memory.free(len_holder)
         if raw != 0:
-            expected: i64 = ((width as i64) * (channels as i64) + 1) * (height as i64)
+            # bytes per scanline = ceil(width * channels * bit_depth / 8), plus 1 filter byte
+            row_bits: i64 = (width as i64) * (channels as i64) * (bit_depth as i64)
+            row_bytes: i64 = (row_bits + 7) / 8
+            expected: i64 = (row_bytes + 1) * (height as i64)
             if raw_len >= expected:
-                pixels: i64 = png_unfilter(raw, width, height, channels)
-                result = png_to_rgba(pixels, width, height, color_type, palette, palette_count, trns, trns_count)
+                pixels: i64 = png_unfilter(raw, width, height, channels, bit_depth)
+                result = png_to_rgba(pixels, width, height, color_type, bit_depth, palette, palette_count, trns, trns_count)
                 Memory.free(pixels)
             Memory.free(raw)
 
