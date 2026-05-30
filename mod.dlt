@@ -9,6 +9,7 @@ import std
 load image/core/color
 load image/core/image
 load image/codecs/ppm
+load image/codecs/png_decoder
 load image/codecs/png
 load image/codecs/jpeg
 load image/ops/draw

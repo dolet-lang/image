@@ -195,5 +195,5 @@ struct PNG:
         return ok
 
     static fun load(path: str) -> Image:
-        # TODO: decode PNG. The first milestone is a valid PNG writer.
-        return Image.empty()
+        # Decode PNG via the pure-Dolet decoder in png_decoder.dlt.
+        return png_decode_file(path)

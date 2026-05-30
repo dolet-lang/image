@@ -1,0 +1,786 @@
+# ============================
+#  PNG Decoder (pure Dolet)
+# ============================
+# Decodes 8-bit PNG files into an RGBA8 Image.
+# Supports color types: 0 (gray), 2 (RGB), 3 (palette), 4 (gray+alpha), 6 (RGBA).
+# Bit depth: 8. Interlace: 0 (no Adam7).
+# Includes a minimal DEFLATE/inflate (RFC 1951) + zlib wrapper (RFC 1950).
+
+PNG_MAXBITS: i32 = 15
+
+# ---------- byte helpers ----------
+
+fun png_dec_u8(data: i64, pos: i64) -> i32:
+    return image_u8_to_i32(Memory.read_i8(data + pos))
+
+fun png_dec_be32(data: i64, pos: i64) -> i64:
+    b0: i64 = png_dec_u8(data, pos) as i64
+    b1: i64 = png_dec_u8(data, pos + 1) as i64
+    b2: i64 = png_dec_u8(data, pos + 2) as i64
+    b3: i64 = png_dec_u8(data, pos + 3) as i64
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+
+fun png_dec_abs(v: i32) -> i32:
+    if v < 0:
+        return 0 - v
+    return v
+
+# ============================
+#  DEFLATE / Inflate (RFC 1951)
+# ============================
+# Minimal canonical-Huffman inflate, modeled on Mark Adler's puff.c.
+# State is mutated through struct-by-reference calls.
+
+struct PngHuffman:
+    count: i64 = 0      # i32[PNG_MAXBITS + 1]
+    symbol: i64 = 0     # i32[n]
+    nsym: i32 = 0
+
+    static fun create(n: i32) -> PngHuffman:
+        c: i64 = Memory.malloc_zeroed(((PNG_MAXBITS + 1) as i64) * 4)
+        s: i64 = Memory.malloc_zeroed((n as i64) * 4)
+        return PngHuffman(count=c, symbol=s, nsym=n)
+
+    fun free(self):
+        if self.count != 0:
+            Memory.free(self.count)
+        if self.symbol != 0:
+            Memory.free(self.symbol)
+        self.count = 0
+        self.symbol = 0
+        self.nsym = 0
+
+    fun get_count(self, len: i32) -> i32:
+        return Memory.read_i32(self.count + ((len as i64) * 4))
+
+    fun set_count(self, len: i32, value: i32):
+        Memory.write_i32(self.count + ((len as i64) * 4), value)
+
+    fun get_symbol(self, idx: i32) -> i32:
+        return Memory.read_i32(self.symbol + ((idx as i64) * 4))
+
+    fun set_symbol(self, idx: i32, value: i32):
+        Memory.write_i32(self.symbol + ((idx as i64) * 4), value)
+
+
+struct PngInflate:
+    out_buf: i64 = 0
+    out_cap: i64 = 0
+    out_cnt: i64 = 0
+    in_buf: i64 = 0
+    in_len: i64 = 0
+    in_cnt: i64 = 0
+    bitbuf: i64 = 0
+    bitcnt: i32 = 0
+    err: i32 = 0
+
+    # Read `need` bits LSB-first from the input stream.
+    fun bits(self, need: i32) -> i32:
+        if need == 0:
+            return 0
+        val: i64 = self.bitbuf
+        while self.bitcnt < need:
+            if self.in_cnt >= self.in_len:
+                self.err = 1
+                return 0
+            next_byte: i64 = png_dec_u8(self.in_buf, self.in_cnt) as i64
+            val = val | (next_byte << self.bitcnt)
+            self.in_cnt = self.in_cnt + 1
+            self.bitcnt = self.bitcnt + 8
+        self.bitbuf = val >> need
+        self.bitcnt = self.bitcnt - need
+        one: i64 = 1
+        mask: i64 = (one << need) - 1
+        return (val & mask) as i32
+
+    # Ensure the output buffer can hold `extra` more bytes; grow if needed.
+    fun ensure(self, extra: i64):
+        needed: i64 = self.out_cnt + extra
+        if needed <= self.out_cap:
+            return
+        new_cap: i64 = self.out_cap
+        if new_cap < 1024:
+            new_cap = 1024
+        while new_cap < needed:
+            new_cap = new_cap * 2
+        new_buf: i64 = Memory.malloc_zeroed(new_cap)
+        if self.out_cnt > 0:
+            Memory.copy(new_buf, self.out_buf, self.out_cnt)
+        if self.out_buf != 0:
+            Memory.free(self.out_buf)
+        self.out_buf = new_buf
+        self.out_cap = new_cap
+
+    fun put_byte(self, value: i32):
+        self.ensure(1)
+        Memory.write_i8(self.out_buf + self.out_cnt, value as i8)
+        self.out_cnt = self.out_cnt + 1
+
+    # Stored (uncompressed) block.
+    fun stored(self):
+        # discard remaining bits in current partially-processed byte
+        self.bitbuf = 0
+        self.bitcnt = 0
+        if (self.in_cnt + 4) > self.in_len:
+            self.err = 2
+            return
+        len_lo: i64 = png_dec_u8(self.in_buf, self.in_cnt) as i64
+        len_hi: i64 = png_dec_u8(self.in_buf, self.in_cnt + 1) as i64
+        block_len: i64 = len_lo | (len_hi << 8)
+        self.in_cnt = self.in_cnt + 4
+        if (self.in_cnt + block_len) > self.in_len:
+            self.err = 2
+            return
+        self.ensure(block_len)
+        Memory.copy(self.out_buf + self.out_cnt, self.in_buf + self.in_cnt, block_len)
+        self.out_cnt = self.out_cnt + block_len
+        self.in_cnt = self.in_cnt + block_len
+
+    # Decode one symbol using the canonical Huffman table `h`.
+    fun decode(self, h: PngHuffman) -> i32:
+        code: i32 = 0
+        first: i32 = 0
+        index: i32 = 0
+        len: i32 = 1
+        while len <= PNG_MAXBITS:
+            code = code | self.bits(1)
+            if self.err != 0:
+                return -1
+            count: i32 = h.get_count(len)
+            if (code - count) < first:
+                return h.get_symbol(index + (code - first))
+            index = index + count
+            first = first + count
+            first = first << 1
+            code = code << 1
+            len = len + 1
+        return -1
+
+# Build a canonical Huffman table from a list of code lengths.
+# lengths: i32[n] in memory. Returns 0 on success.
+fun png_build_huffman(h: PngHuffman, lengths: i64, n: i32) -> i32:
+    # count number of codes of each length
+    len_idx: i32 = 0
+    while len_idx <= PNG_MAXBITS:
+        h.set_count(len_idx, 0)
+        len_idx = len_idx + 1
+    sym: i32 = 0
+    while sym < n:
+        l: i32 = Memory.read_i32(lengths + ((sym as i64) * 4))
+        h.set_count(l, h.get_count(l) + 1)
+        sym = sym + 1
+    # all-zero code lengths => empty (valid: nothing to decode)
+    if h.get_count(0) == n:
+        return 0
+    # check for over-subscribed or incomplete code set
+    left: i32 = 1
+    l2: i32 = 1
+    while l2 <= PNG_MAXBITS:
+        left = left << 1
+        left = left - h.get_count(l2)
+        if left < 0:
+            return -1
+        l2 = l2 + 1
+    # generate offsets into symbol table for each length
+    offs: i64 = Memory.malloc_zeroed(((PNG_MAXBITS + 2) as i64) * 4)
+    Memory.write_i32(offs + 4, 0)
+    li: i32 = 1
+    while li < PNG_MAXBITS:
+        prev: i32 = Memory.read_i32(offs + ((li as i64) * 4))
+        Memory.write_i32(offs + (((li + 1) as i64) * 4), prev + h.get_count(li))
+        li = li + 1
+    # put symbols in order, sorted by code length
+    sym2: i32 = 0
+    while sym2 < n:
+        l3: i32 = Memory.read_i32(lengths + ((sym2 as i64) * 4))
+        if l3 != 0:
+            slot: i32 = Memory.read_i32(offs + ((l3 as i64) * 4))
+            h.set_symbol(slot, sym2)
+            Memory.write_i32(offs + ((l3 as i64) * 4), slot + 1)
+        sym2 = sym2 + 1
+    Memory.free(offs)
+    if left > 0:
+        # incomplete code set: tolerated for single-symbol cases
+        return 0
+    return 0
+
+# Length base values for codes 257..285 (index 0 == code 257).
+fun png_len_base(idx: i32) -> i32:
+    if idx == 0: return 3
+    if idx == 1: return 4
+    if idx == 2: return 5
+    if idx == 3: return 6
+    if idx == 4: return 7
+    if idx == 5: return 8
+    if idx == 6: return 9
+    if idx == 7: return 10
+    if idx == 8: return 11
+    if idx == 9: return 13
+    if idx == 10: return 15
+    if idx == 11: return 17
+    if idx == 12: return 19
+    if idx == 13: return 23
+    if idx == 14: return 27
+    if idx == 15: return 31
+    if idx == 16: return 35
+    if idx == 17: return 43
+    if idx == 18: return 51
+    if idx == 19: return 59
+    if idx == 20: return 67
+    if idx == 21: return 83
+    if idx == 22: return 99
+    if idx == 23: return 115
+    if idx == 24: return 131
+    if idx == 25: return 163
+    if idx == 26: return 195
+    if idx == 27: return 227
+    return 258
+
+fun png_len_extra(idx: i32) -> i32:
+    if idx < 8: return 0
+    if idx == 28: return 0
+    return (idx - 8) / 4 + 1
+
+# Distance base values for codes 0..29.
+fun png_dist_base(idx: i32) -> i32:
+    if idx == 0: return 1
+    if idx == 1: return 2
+    if idx == 2: return 3
+    if idx == 3: return 4
+    if idx == 4: return 5
+    if idx == 5: return 7
+    if idx == 6: return 9
+    if idx == 7: return 13
+    if idx == 8: return 17
+    if idx == 9: return 25
+    if idx == 10: return 33
+    if idx == 11: return 49
+    if idx == 12: return 65
+    if idx == 13: return 97
+    if idx == 14: return 129
+    if idx == 15: return 193
+    if idx == 16: return 257
+    if idx == 17: return 385
+    if idx == 18: return 513
+    if idx == 19: return 769
+    if idx == 20: return 1025
+    if idx == 21: return 1537
+    if idx == 22: return 2049
+    if idx == 23: return 3073
+    if idx == 24: return 4097
+    if idx == 25: return 6145
+    if idx == 26: return 8193
+    if idx == 27: return 12289
+    if idx == 28: return 16385
+    return 24577
+
+fun png_dist_extra(idx: i32) -> i32:
+    if idx < 2: return 0
+    return (idx - 2) / 2
+
+# Decode literal/length + distance codes for one block (shared by fixed/dynamic).
+fun png_codes(st: PngInflate, lencode: PngHuffman, distcode: PngHuffman) -> i32:
+    done: i32 = 0
+    while done == 0:
+        sym: i32 = st.decode(lencode)
+        if st.err != 0:
+            return -1
+        if sym < 0:
+            return -1
+        if sym == 256:
+            done = 1
+        else:
+            if sym < 256:
+                st.put_byte(sym)
+            else:
+                lidx: i32 = sym - 257
+                if lidx >= 29:
+                    return -1
+                length: i32 = png_len_base(lidx)
+                eb: i32 = png_len_extra(lidx)
+                if eb > 0:
+                    length = length + st.bits(eb)
+                dsym: i32 = st.decode(distcode)
+                if st.err != 0:
+                    return -1
+                if dsym < 0:
+                    return -1
+                if dsym >= 30:
+                    return -1
+                dist: i32 = png_dist_base(dsym)
+                deb: i32 = png_dist_extra(dsym)
+                if deb > 0:
+                    dist = dist + st.bits(deb)
+                dist64: i64 = dist as i64
+                if dist64 > st.out_cnt:
+                    return -1
+                st.ensure(length as i64)
+                k: i32 = 0
+                while k < length:
+                    src: i64 = st.out_cnt - dist64
+                    b: i32 = image_u8_to_i32(Memory.read_i8(st.out_buf + src))
+                    Memory.write_i8(st.out_buf + st.out_cnt, b as i8)
+                    st.out_cnt = st.out_cnt + 1
+                    k = k + 1
+        if st.err != 0:
+            return -1
+    return 0
+
+# Fixed Huffman block: literal/length and distance code lengths are predefined.
+fun png_fixed(st: PngInflate) -> i32:
+    lens: i64 = Memory.malloc_zeroed(288 * 4)
+    i: i32 = 0
+    while i < 144:
+        Memory.write_i32(lens + ((i as i64) * 4), 8)
+        i = i + 1
+    while i < 256:
+        Memory.write_i32(lens + ((i as i64) * 4), 9)
+        i = i + 1
+    while i < 280:
+        Memory.write_i32(lens + ((i as i64) * 4), 7)
+        i = i + 1
+    while i < 288:
+        Memory.write_i32(lens + ((i as i64) * 4), 8)
+        i = i + 1
+    lencode: PngHuffman = PngHuffman.create(288)
+    png_build_huffman(lencode, lens, 288)
+    dlens: i64 = Memory.malloc_zeroed(30 * 4)
+    j: i32 = 0
+    while j < 30:
+        Memory.write_i32(dlens + ((j as i64) * 4), 5)
+        j = j + 1
+    distcode: PngHuffman = PngHuffman.create(30)
+    png_build_huffman(distcode, dlens, 30)
+    rc: i32 = png_codes(st, lencode, distcode)
+    lencode.free()
+    distcode.free()
+    Memory.free(lens)
+    Memory.free(dlens)
+    return rc
+
+# Order in which code-length code lengths are stored.
+fun png_clcidx(i: i32) -> i32:
+    if i == 0: return 16
+    if i == 1: return 17
+    if i == 2: return 18
+    if i == 3: return 0
+    if i == 4: return 8
+    if i == 5: return 7
+    if i == 6: return 9
+    if i == 7: return 6
+    if i == 8: return 10
+    if i == 9: return 5
+    if i == 10: return 11
+    if i == 11: return 4
+    if i == 12: return 12
+    if i == 13: return 3
+    if i == 14: return 13
+    if i == 15: return 2
+    if i == 16: return 14
+    if i == 17: return 1
+    return 15
+
+# Dynamic Huffman block: code lengths are themselves Huffman-coded.
+fun png_dynamic(st: PngInflate) -> i32:
+    hlit: i32 = st.bits(5) + 257
+    hdist: i32 = st.bits(5) + 1
+    hclen: i32 = st.bits(4) + 4
+    if st.err != 0:
+        return -1
+    if hlit > 286:
+        return -1
+    if hdist > 30:
+        return -1
+
+    # read code-length code lengths
+    cl_lens: i64 = Memory.malloc_zeroed(19 * 4)
+    ci: i32 = 0
+    while ci < hclen:
+        v: i32 = st.bits(3)
+        Memory.write_i32(cl_lens + ((png_clcidx(ci) as i64) * 4), v)
+        ci = ci + 1
+    if st.err != 0:
+        Memory.free(cl_lens)
+        return -1
+    clcode: PngHuffman = PngHuffman.create(19)
+    if png_build_huffman(clcode, cl_lens, 19) != 0:
+        clcode.free()
+        Memory.free(cl_lens)
+        return -1
+
+    total: i32 = hlit + hdist
+    all_lens: i64 = Memory.malloc_zeroed((total as i64) * 4)
+    idx: i32 = 0
+    while idx < total:
+        sym: i32 = st.decode(clcode)
+        if st.err != 0 or sym < 0:
+            clcode.free()
+            Memory.free(cl_lens)
+            Memory.free(all_lens)
+            return -1
+        if sym < 16:
+            Memory.write_i32(all_lens + ((idx as i64) * 4), sym)
+            idx = idx + 1
+        else:
+            rep_val: i32 = 0
+            rep_cnt: i32 = 0
+            if sym == 16:
+                if idx == 0:
+                    clcode.free()
+                    Memory.free(cl_lens)
+                    Memory.free(all_lens)
+                    return -1
+                rep_val = Memory.read_i32(all_lens + (((idx - 1) as i64) * 4))
+                rep_cnt = 3 + st.bits(2)
+            else:
+                if sym == 17:
+                    rep_cnt = 3 + st.bits(3)
+                else:
+                    rep_cnt = 11 + st.bits(7)
+            r: i32 = 0
+            while r < rep_cnt:
+                if idx >= total:
+                    r = rep_cnt
+                else:
+                    Memory.write_i32(all_lens + ((idx as i64) * 4), rep_val)
+                    idx = idx + 1
+                    r = r + 1
+        if st.err != 0:
+            clcode.free()
+            Memory.free(cl_lens)
+            Memory.free(all_lens)
+            return -1
+
+    # split into literal/length and distance code lengths
+    lencode: PngHuffman = PngHuffman.create(hlit)
+    distcode: PngHuffman = PngHuffman.create(hdist)
+    if png_build_huffman(lencode, all_lens, hlit) != 0:
+        lencode.free()
+        distcode.free()
+        clcode.free()
+        Memory.free(cl_lens)
+        Memory.free(all_lens)
+        return -1
+    dist_lens: i64 = all_lens + ((hlit as i64) * 4)
+    png_build_huffman(distcode, dist_lens, hdist)
+
+    rc: i32 = png_codes(st, lencode, distcode)
+    lencode.free()
+    distcode.free()
+    clcode.free()
+    Memory.free(cl_lens)
+    Memory.free(all_lens)
+    return rc
+
+# Inflate a raw DEFLATE stream. Returns output buffer pointer (caller frees),
+# and writes the output length to the i64 at out_len_ptr. Returns 0 on failure.
+fun png_inflate(in_buf: i64, in_len: i64, out_len_ptr: i64) -> i64:
+    st: PngInflate = PngInflate(out_buf=0, out_cap=0, out_cnt=0, in_buf=in_buf, in_len=in_len, in_cnt=0, bitbuf=0, bitcnt=0, err=0)
+    final: i32 = 0
+    while final == 0:
+        final = st.bits(1)
+        btype: i32 = st.bits(2)
+        if st.err != 0:
+            final = 1
+        else:
+            if btype == 0:
+                st.stored()
+            else:
+                if btype == 1:
+                    if png_fixed(st) != 0:
+                        st.err = 3
+                else:
+                    if btype == 2:
+                        if png_dynamic(st) != 0:
+                            st.err = 3
+                    else:
+                        st.err = 4
+            if st.err != 0:
+                final = 1
+    if st.err != 0:
+        if st.out_buf != 0:
+            Memory.free(st.out_buf)
+        Memory.write_i64(out_len_ptr, 0)
+        return 0
+    Memory.write_i64(out_len_ptr, st.out_cnt)
+    return st.out_buf
+
+# Inflate a zlib stream (2-byte header + DEFLATE + adler32 trailer).
+fun png_zlib_inflate(in_buf: i64, in_len: i64, out_len_ptr: i64) -> i64:
+    if in_len < 2:
+        Memory.write_i64(out_len_ptr, 0)
+        return 0
+    cmf: i32 = png_dec_u8(in_buf, 0)
+    cm: i32 = cmf & 15
+    if cm != 8:
+        Memory.write_i64(out_len_ptr, 0)
+        return 0
+    # skip 2-byte zlib header; ignore preset dictionary (FDICT) for PNG (never set)
+    return png_inflate(in_buf + 2, in_len - 2, out_len_ptr)
+
+# ============================
+#  PNG container + unfilter
+# ============================
+
+fun png_paeth(a: i32, b: i32, c: i32) -> i32:
+    p: i32 = a + b - c
+    pa: i32 = png_dec_abs(p - a)
+    pb: i32 = png_dec_abs(p - b)
+    pc: i32 = png_dec_abs(p - c)
+    if pa <= pb:
+        if pa <= pc:
+            return a
+        return c
+    if pb <= pc:
+        return b
+    return c
+
+# Number of channels for a given PNG color type.
+fun png_channels(color_type: i32) -> i32:
+    if color_type == 0: return 1     # grayscale
+    if color_type == 2: return 3     # RGB
+    if color_type == 3: return 1     # palette index
+    if color_type == 4: return 2     # gray + alpha
+    if color_type == 6: return 4     # RGBA
+    return 0
+
+# Unfilter raw scanlines in-place-ish into a freshly allocated buffer of
+# size height * (width * channels). `raw` holds height rows, each prefixed
+# with a 1-byte filter type, stride = 1 + width*channels.
+# Returns the unfiltered buffer (caller frees) or 0 on failure.
+fun png_unfilter(raw: i64, width: i32, height: i32, channels: i32) -> i64:
+    bpp: i32 = channels                       # 8-bit: bytes per pixel == channels
+    row_bytes: i64 = (width as i64) * (channels as i64)
+    out: i64 = Memory.malloc_zeroed(row_bytes * (height as i64))
+    src_stride: i64 = row_bytes + 1
+    y: i32 = 0
+    while y < height:
+        ft: i32 = png_dec_u8(raw, (y as i64) * src_stride)
+        src_row: i64 = raw + ((y as i64) * src_stride) + 1
+        dst_row: i64 = out + ((y as i64) * row_bytes)
+        prev_row: i64 = 0
+        if y > 0:
+            prev_row = out + (((y - 1) as i64) * row_bytes)
+        x: i64 = 0
+        while x < row_bytes:
+            raw_b: i32 = image_u8_to_i32(Memory.read_i8(src_row + x))
+            a: i32 = 0
+            if x >= (bpp as i64):
+                a = image_u8_to_i32(Memory.read_i8(dst_row + x - (bpp as i64)))
+            b: i32 = 0
+            if prev_row != 0:
+                b = image_u8_to_i32(Memory.read_i8(prev_row + x))
+            c: i32 = 0
+            if prev_row != 0:
+                if x >= (bpp as i64):
+                    c = image_u8_to_i32(Memory.read_i8(prev_row + x - (bpp as i64)))
+            val: i32 = raw_b
+            if ft == 1:
+                val = raw_b + a
+            else:
+                if ft == 2:
+                    val = raw_b + b
+                else:
+                    if ft == 3:
+                        val = raw_b + ((a + b) / 2)
+                    else:
+                        if ft == 4:
+                            val = raw_b + png_paeth(a, b, c)
+            Memory.write_i8(dst_row + x, (val & 255) as i8)
+            x = x + 1
+        y = y + 1
+    return out
+
+# Convert unfiltered channel data into an RGBA Image.
+# palette/trns may be 0 when color_type != 3.
+fun png_to_rgba(pixels: i64, width: i32, height: i32, color_type: i32, palette: i64, palette_count: i32, trns: i64, trns_count: i32) -> Image:
+    img: Image = Image.create(width, height)
+    if img.is_valid() == 0:
+        return img
+    channels: i32 = png_channels(color_type)
+    row_bytes: i64 = (width as i64) * (channels as i64)
+    y: i32 = 0
+    while y < height:
+        x: i32 = 0
+        while x < width:
+            base: i64 = ((y as i64) * row_bytes) + ((x as i64) * (channels as i64))
+            r: i32 = 0
+            g: i32 = 0
+            b: i32 = 0
+            a: i32 = 255
+            if color_type == 0:
+                gray: i32 = image_u8_to_i32(Memory.read_i8(pixels + base))
+                r = gray
+                g = gray
+                b = gray
+            else:
+                if color_type == 2:
+                    r = image_u8_to_i32(Memory.read_i8(pixels + base))
+                    g = image_u8_to_i32(Memory.read_i8(pixels + base + 1))
+                    b = image_u8_to_i32(Memory.read_i8(pixels + base + 2))
+                else:
+                    if color_type == 3:
+                        pidx: i32 = image_u8_to_i32(Memory.read_i8(pixels + base))
+                        if pidx < palette_count:
+                            r = image_u8_to_i32(Memory.read_i8(palette + ((pidx as i64) * 3)))
+                            g = image_u8_to_i32(Memory.read_i8(palette + ((pidx as i64) * 3) + 1))
+                            b = image_u8_to_i32(Memory.read_i8(palette + ((pidx as i64) * 3) + 2))
+                        if trns != 0:
+                            if pidx < trns_count:
+                                a = image_u8_to_i32(Memory.read_i8(trns + (pidx as i64)))
+                    else:
+                        if color_type == 4:
+                            gray2: i32 = image_u8_to_i32(Memory.read_i8(pixels + base))
+                            r = gray2
+                            g = gray2
+                            b = gray2
+                            a = image_u8_to_i32(Memory.read_i8(pixels + base + 1))
+                        else:
+                            r = image_u8_to_i32(Memory.read_i8(pixels + base))
+                            g = image_u8_to_i32(Memory.read_i8(pixels + base + 1))
+                            b = image_u8_to_i32(Memory.read_i8(pixels + base + 2))
+                            a = image_u8_to_i32(Memory.read_i8(pixels + base + 3))
+            img.set_pixel(x, y, image_rgba(r, g, b, a))
+            x = x + 1
+        y = y + 1
+    return img
+
+# Decode a full PNG file from an in-memory byte buffer. Returns an Image
+# (call .is_valid() to check). Does not free `file_buf`.
+fun png_decode_bytes(file_buf: i64, file_len: i64) -> Image:
+    if file_len < 8:
+        return Image.empty()
+    # verify signature: 137 80 78 71 13 10 26 10
+    sig_ok: i32 = 1
+    if png_dec_u8(file_buf, 0) != 137: sig_ok = 0
+    if png_dec_u8(file_buf, 1) != 80: sig_ok = 0
+    if png_dec_u8(file_buf, 2) != 78: sig_ok = 0
+    if png_dec_u8(file_buf, 3) != 71: sig_ok = 0
+    if sig_ok == 0:
+        return Image.empty()
+
+    width: i32 = 0
+    height: i32 = 0
+    bit_depth: i32 = 0
+    color_type: i32 = 0
+    interlace: i32 = 0
+
+    palette: i64 = 0
+    palette_count: i32 = 0
+    trns: i64 = 0
+    trns_count: i32 = 0
+
+    # accumulate IDAT into a growing buffer
+    idat: i64 = 0
+    idat_cap: i64 = 0
+    idat_len: i64 = 0
+
+    pos: i64 = 8
+    saw_iend: i32 = 0
+    err: i32 = 0
+    while pos + 8 <= file_len and saw_iend == 0 and err == 0:
+        clen: i64 = png_dec_be32(file_buf, pos)
+        t0: i32 = png_dec_u8(file_buf, pos + 4)
+        t1: i32 = png_dec_u8(file_buf, pos + 5)
+        t2: i32 = png_dec_u8(file_buf, pos + 6)
+        t3: i32 = png_dec_u8(file_buf, pos + 7)
+        data_pos: i64 = pos + 8
+        if data_pos + clen > file_len:
+            err = 1
+        else:
+            # IHDR
+            if t0 == 73 and t1 == 72 and t2 == 68 and t3 == 82:
+                width = png_dec_be32(file_buf, data_pos) as i32
+                height = png_dec_be32(file_buf, data_pos + 4) as i32
+                bit_depth = png_dec_u8(file_buf, data_pos + 8)
+                color_type = png_dec_u8(file_buf, data_pos + 9)
+                interlace = png_dec_u8(file_buf, data_pos + 12)
+            # PLTE
+            if t0 == 80 and t1 == 76 and t2 == 84 and t3 == 69:
+                palette_count = (clen / 3) as i32
+                palette = Memory.malloc_zeroed(clen)
+                Memory.copy(palette, file_buf + data_pos, clen)
+            # tRNS
+            if t0 == 116 and t1 == 82 and t2 == 78 and t3 == 83:
+                trns_count = clen as i32
+                trns = Memory.malloc_zeroed(clen)
+                Memory.copy(trns, file_buf + data_pos, clen)
+            # IDAT
+            if t0 == 73 and t1 == 68 and t2 == 65 and t3 == 84:
+                needed: i64 = idat_len + clen
+                if needed > idat_cap:
+                    new_cap: i64 = idat_cap
+                    if new_cap < 4096:
+                        new_cap = 4096
+                    while new_cap < needed:
+                        new_cap = new_cap * 2
+                    new_buf: i64 = Memory.malloc_zeroed(new_cap)
+                    if idat_len > 0:
+                        Memory.copy(new_buf, idat, idat_len)
+                    if idat != 0:
+                        Memory.free(idat)
+                    idat = new_buf
+                    idat_cap = new_cap
+                Memory.copy(idat + idat_len, file_buf + data_pos, clen)
+                idat_len = idat_len + clen
+            # IEND
+            if t0 == 73 and t1 == 69 and t2 == 78 and t3 == 68:
+                saw_iend = 1
+            pos = data_pos + clen + 4   # skip data + 4-byte CRC
+    return png_finish_decode(width, height, bit_depth, color_type, interlace, palette, palette_count, trns, trns_count, idat, idat_len)
+
+# Validate header, inflate IDAT, unfilter, convert to RGBA, free temporaries.
+fun png_finish_decode(width: i32, height: i32, bit_depth: i32, color_type: i32, interlace: i32, palette: i64, palette_count: i32, trns: i64, trns_count: i32, idat: i64, idat_len: i64) -> Image:
+    result: Image = Image.empty()
+    ok: i32 = 1
+    if width <= 0 or height <= 0:
+        ok = 0
+    if bit_depth != 8:
+        ok = 0
+    if interlace != 0:
+        ok = 0
+    channels: i32 = png_channels(color_type)
+    if channels == 0:
+        ok = 0
+    if idat == 0 or idat_len == 0:
+        ok = 0
+
+    if ok == 1:
+        len_holder: i64 = Memory.malloc_zeroed(8)
+        raw: i64 = png_zlib_inflate(idat, idat_len, len_holder)
+        raw_len: i64 = Memory.read_i64(len_holder)
+        Memory.free(len_holder)
+        if raw != 0:
+            expected: i64 = ((width as i64) * (channels as i64) + 1) * (height as i64)
+            if raw_len >= expected:
+                pixels: i64 = png_unfilter(raw, width, height, channels)
+                result = png_to_rgba(pixels, width, height, color_type, palette, palette_count, trns, trns_count)
+                Memory.free(pixels)
+            Memory.free(raw)
+
+    if palette != 0:
+        Memory.free(palette)
+    if trns != 0:
+        Memory.free(trns)
+    if idat != 0:
+        Memory.free(idat)
+    return result
+
+# Load and decode a PNG file from disk into an RGBA Image.
+fun png_decode_file(path: str) -> Image:
+    file: File = File.open_cwd(path, "r")
+    if file.is_valid() == false:
+        return Image.empty()
+    size: i64 = file.get_size()
+    if size <= 0:
+        file.close()
+        return Image.empty()
+    buf: i64 = Memory.malloc_zeroed(size)
+    read: i32 = file.read_bytes(buf, size as i32)
+    file.close()
+    if (read as i64) < size:
+        Memory.free(buf)
+        return Image.empty()
+    img: Image = png_decode_bytes(buf, size)
+    Memory.free(buf)
+    return img
