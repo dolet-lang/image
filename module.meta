@@ -4,6 +4,7 @@
 [info]
 name = image
 version = 0.1.0
+layer = pure
 description = Pure Dolet image buffer, pixel operations, simple codecs, drawing, filters, and transforms.
 
 [dependencies]
